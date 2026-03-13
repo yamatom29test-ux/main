@@ -21,7 +21,7 @@ const wss = new WebSocket.Server({ server });
 function requireApiKey(req, res, next) {
     const validKey = process.env.API_KEY;
     if (!validKey) return res.status(500).json({ error: 'API_KEY not configured on server' });
-    const key = req.headers['x-api-key'] || req.query.key;
+    const key = req.headers['541a3e988bd06e5922d6598560855a84'] || req.query.key;
     if (!key || key !== validKey) {
         return res.status(401).json({ error: 'Unauthorized: invalid or missing API key' });
     }
