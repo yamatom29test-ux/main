@@ -16,16 +16,27 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ============================================
+// 🔑 API KEY MIDDLEWARE
+// ============================================
+function requireApiKey(req, res, next) {
+    const validKey = process.env.API_KEY;
+    if (!validKey) return res.status(500).json({ error: 'API_KEY not configured on server' });
+    const key = req.headers['x-api-key'] || req.query.key;
+    if (!key || key !== validKey) {
+        return res.status(401).json({ error: 'Unauthorized: invalid or missing API key' });
+    }
+    next();
+}
+
+// ============================================
 // IN-MEMORY STORAGE
 // ============================================
 const alerts = [];
 const MAX_ALERTS = 500;
 const ALERT_TTL = 5 * 60 * 1000;
 
-// ✅ NOUVEAU: groupement des alertes par serveur
-// Clé: serverId — stocke tous les brainrots trouvés dans ce serveur
 const serverGroups = new Map();
-const SERVER_GROUP_TTL = 30 * 1000; // 30s pour regrouper les alertes d'un même serveur
+const SERVER_GROUP_TTL = 30 * 1000;
 
 const userPresence = new Map();
 const PRESENCE_TTL = 15 * 1000;
@@ -39,7 +50,16 @@ let alertIdCounter = Date.now();
 const wsClients = new Set();
 const wsStats = { connected: 0, peak: 0, totalBroadcasts: 0 };
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+    // 🔑 Vérification API key sur la connexion WebSocket (via query param)
+    const url = new URL(req.url, `http://localhost`);
+    const wsKey = url.searchParams.get('key');
+    const validKey = process.env.API_KEY;
+    if (validKey && wsKey !== validKey) {
+        ws.close(4001, 'Unauthorized');
+        return;
+    }
+
     wsClients.add(ws);
     wsStats.connected = wsClients.size;
     if (wsClients.size > wsStats.peak) wsStats.peak = wsClients.size;
@@ -88,7 +108,6 @@ function broadcastAlert(alert) {
     wsStats.totalBroadcasts += sent;
 }
 
-// ✅ NOUVEAU: broadcast groupé — envoie l'état complet du groupe serveur
 function broadcastServerGroup(group) {
     if (wsClients.size === 0) return;
     const msg = JSON.stringify({ type: 'server_update', group });
@@ -108,19 +127,16 @@ function broadcastServerGroup(group) {
 setInterval(() => {
     const now = Date.now();
 
-    // Nettoyage des alertes expirées
     while (alerts.length > 0 && now - alerts[0].timestamp > ALERT_TTL) {
         alerts.shift();
     }
 
-    // ✅ Nettoyage des groupes serveur expirés
     for (const [serverId, group] of serverGroups.entries()) {
         if (now - group.lastUpdate > SERVER_GROUP_TTL) {
             serverGroups.delete(serverId);
         }
     }
 
-    // Nettoyage des présences expirées
     let cleaned = 0;
     for (const [key, user] of userPresence.entries()) {
         if (now - user.lastSeen > PRESENCE_TTL) {
@@ -134,7 +150,7 @@ setInterval(() => {
 }, PRESENCE_CLEANUP_INTERVAL);
 
 // ============================================
-// ROUTES
+// ROUTES PUBLIQUES (pas de clé requise)
 // ============================================
 app.get('/', (req, res) => {
     res.json({
@@ -164,10 +180,11 @@ app.get('/health', (req, res) => {
 });
 
 // ============================================
-// POST /alert — CHAQUE BRAINROT INDIVIDUELLEMENT
-// ✅ Compatible avec le nouveau scanner qui envoie 1 requête par brainrot
+// 🔒 ROUTES PROTÉGÉES PAR API KEY
 // ============================================
-app.post('/alert', (req, res) => {
+
+// POST /alert — reçoit les alertes des bots scanners
+app.post('/alert', requireApiKey, (req, res) => {
     try {
         const {
             brainrotName, value, serverId, placeId,
@@ -181,7 +198,6 @@ app.post('/alert', (req, res) => {
         const now = Date.now();
         const alertId = ++alertIdCounter;
 
-        // ✅ Alerte individuelle pour chaque brainrot
         const alert = {
             id: alertId,
             brainrotName,
@@ -199,11 +215,8 @@ app.post('/alert', (req, res) => {
         alerts.push(alert);
         while (alerts.length > MAX_ALERTS) alerts.shift();
 
-        // ✅ Broadcast immédiat de l'alerte individuelle (pour lecture brainrot par brainrot)
         broadcastAlert(alert);
 
-        // ✅ NOUVEAU: groupement par serveur pour avoir la vue complète du serveur
-        // Permet au frontend d'afficher tous les brainrots d'un même serveur regroupés
         if (!serverGroups.has(serverId)) {
             serverGroups.set(serverId, {
                 serverId,
@@ -222,7 +235,6 @@ app.post('/alert', (req, res) => {
         group.lastUpdate = now;
         group.players = players || group.players;
 
-        // Ajoute ou met à jour ce brainrot dans le groupe
         const existingIdx = group.brainrots.findIndex(b => b.brainrotName === brainrotName);
         const brainrotEntry = { brainrotName, value: value || '0', priority: priority || 3, inDuel: inDuel || false };
 
@@ -232,21 +244,18 @@ app.post('/alert', (req, res) => {
             group.brainrots.push(brainrotEntry);
         }
 
-        // Trie les brainrots du groupe par valeur (meilleur en premier)
         group.brainrots.sort((a, b) => {
             const valA = parseFloat(a.value.replace(/[KMBTQ]/g, s => ({K:1e3,M:1e6,B:1e9,T:1e12,Q:1e15}[s]||1))) || 0;
             const valB = parseFloat(b.value.replace(/[KMBTQ]/g, s => ({K:1e3,M:1e6,B:1e9,T:1e12,Q:1e15}[s]||1))) || 0;
             return valB - valA;
         });
 
-        // Met à jour le meilleur brainrot du groupe
         if (group.brainrots.length > 0) {
             group.bestValue = group.brainrots[0].value;
             group.bestBrainrot = group.brainrots[0].brainrotName;
             group.bestPriority = Math.min(...group.brainrots.map(b => b.priority || 3));
         }
 
-        // Broadcast du groupe mis à jour (pour la vue "tous les brainrots du serveur")
         broadcastServerGroup(group);
 
         console.log(`[ALERT] ${brainrotName} | ${value} | P${priority} | ${serverId.substring(0, 8)} | groupe: ${group.brainrots.length} brainrots | WS->${wsStats.connected}`);
@@ -258,10 +267,8 @@ app.post('/alert', (req, res) => {
     }
 });
 
-// ============================================
-// GET /alerts — POLLING FALLBACK (alertes individuelles)
-// ============================================
-app.get('/alerts', (req, res) => {
+// GET /alerts — polling fallback (script Lua Uchiwa)
+app.get('/alerts', requireApiKey, (req, res) => {
     try {
         const since = parseInt(req.query.since) || 0;
         const filtered = alerts.filter(a => a.timestamp > since || a.id > since);
@@ -272,17 +279,13 @@ app.get('/alerts', (req, res) => {
     }
 });
 
-// ============================================
-// ✅ NOUVEAU: GET /server-groups — Vue regroupée par serveur
-// Retourne tous les brainrots de chaque serveur actif, meilleur en premier
-// ============================================
-app.get('/server-groups', (req, res) => {
+// GET /server-groups — vue regroupée par serveur
+app.get('/server-groups', requireApiKey, (req, res) => {
     try {
         const groups = [];
         for (const [, group] of serverGroups.entries()) {
             groups.push(group);
         }
-        // Trie les groupes par priorité puis par meilleure valeur
         groups.sort((a, b) => (a.bestPriority || 3) - (b.bestPriority || 3));
         res.json({ groups, serverTime: Date.now(), count: groups.length });
     } catch (err) {
@@ -292,9 +295,9 @@ app.get('/server-groups', (req, res) => {
 });
 
 // ============================================
-// USER PRESENCE
+// USER PRESENCE (protégé)
 // ============================================
-app.post('/user-presence', (req, res) => {
+app.post('/user-presence', requireApiKey, (req, res) => {
     try {
         const { username, userId, jobId } = req.body;
         if (!userId || !jobId) return res.status(400).json({ error: 'Missing: userId, jobId' });
@@ -324,7 +327,7 @@ app.post('/user-presence', (req, res) => {
     }
 });
 
-app.get('/user-presence', (req, res) => {
+app.get('/user-presence', requireApiKey, (req, res) => {
     try {
         const { jobId } = req.query;
 
@@ -350,7 +353,7 @@ app.get('/user-presence', (req, res) => {
     }
 });
 
-app.delete('/user-presence', (req, res) => {
+app.delete('/user-presence', requireApiKey, (req, res) => {
     try {
         const { userId, jobId } = req.body;
         if (!userId || !jobId) return res.status(400).json({ error: 'Missing: userId, jobId' });
@@ -372,9 +375,9 @@ app.delete('/user-presence', (req, res) => {
 });
 
 // ============================================
-// DEBUG
+// DEBUG (protégé)
 // ============================================
-app.get('/debug/presence', (req, res) => {
+app.get('/debug/presence', requireApiKey, (req, res) => {
     const data = {};
     for (const [, user] of userPresence.entries()) {
         if (!data[user.jobId]) data[user.jobId] = [];
@@ -386,7 +389,7 @@ app.get('/debug/presence', (req, res) => {
     res.json({ totalUsers: userPresence.size, servers: Object.keys(data).length, data });
 });
 
-app.get('/debug/alerts', (req, res) => {
+app.get('/debug/alerts', requireApiKey, (req, res) => {
     const now = Date.now();
     res.json({
         total: alerts.length,
@@ -398,8 +401,7 @@ app.get('/debug/alerts', (req, res) => {
     });
 });
 
-// ✅ NOUVEAU: debug des groupes serveur actifs
-app.get('/debug/server-groups', (req, res) => {
+app.get('/debug/server-groups', requireApiKey, (req, res) => {
     const groups = [];
     for (const [, group] of serverGroups.entries()) {
         groups.push({
@@ -420,6 +422,7 @@ app.get('/debug/server-groups', (req, res) => {
 server.listen(PORT, () => {
     console.log(`Brainrot Notifier v2.3 on port ${PORT}`);
     console.log(`WebSocket: ws://0.0.0.0:${PORT}`);
+    console.log(`API Key protection: ${process.env.API_KEY ? '✅ ACTIVE' : '❌ API_KEY NOT SET!'}`);
     console.log(`Scanner POST /alert -> 1 requête par brainrot -> instant WS broadcast`);
     console.log(`Vue groupée: GET /server-groups`);
     console.log(`Polling fallback: GET /alerts?since=ts`);
